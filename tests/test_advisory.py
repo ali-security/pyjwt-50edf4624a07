@@ -1,10 +1,16 @@
+import hashlib
+import hmac
+import json
+
 import pytest
 
 import jwt
 from jwt.algorithms import get_default_algorithms
+from jwt.api_jws import PyJWS
 from jwt.exceptions import InvalidKeyError
+from jwt.utils import base64url_encode
 
-from .utils import crypto_required
+from .utils import crypto_required, key_path
 
 priv_key_bytes = b"""-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIIbBhdo2ah7X32i50GOzrCr4acZTe6BezUdRIixjTAdL
@@ -117,3 +123,36 @@ class TestAdvisory:
                 ssh_key_bytes,
                 algorithms=algorithm_names,
             )
+
+    def test_ghsa_xgmm_8j9v_c9wx(self):
+        # CVE-2026-48526: a verifier that allows both HMAC and asymmetric
+        # algorithms and passes a raw public JWK (JSON text) as the key must
+        # not let an attacker forge an HS256 token by using that public JWK
+        # text as the HMAC secret.
+        def forge(jwk_text, claims):
+            header = base64url_encode(b'{"alg":"HS256","typ":"JWT"}')
+            payload = base64url_encode(json.dumps(claims).encode())
+            signing_input = header + b"." + payload
+            secret = jwk_text.encode() if isinstance(jwk_text, str) else jwk_text
+            sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
+            return (signing_input + b"." + base64url_encode(sig)).decode()
+
+        claims = {"sub": "alice", "admin": True}
+
+        with open(key_path("jwk_rsa_pub.json"), "rb") as keyfile:
+            rsa_jwk_bytes = keyfile.read()
+        poc_jwk_text = json.dumps({"kty": "RSA", "n": "AQAB", "e": "AQAB"})
+
+        for jwk_key in (
+            rsa_jwk_bytes,
+            rsa_jwk_bytes.decode(),
+            poc_jwk_text,
+            "  \n" + poc_jwk_text,
+        ):
+            forged = forge(jwk_key, claims)
+
+            with pytest.raises(InvalidKeyError, match="looks like a JWK"):
+                jwt.decode(forged, jwk_key, algorithms=["HS256", "RS256"])
+
+            with pytest.raises(InvalidKeyError, match="looks like a JWK"):
+                PyJWS().decode(forged, key=jwk_key, algorithms=["HS256", "RS256"])
